@@ -35,6 +35,7 @@ func CreateUnifiRouter(baseURL, username, password, site, apiKey string) (*Unifi
 		clientConfig.APIKey = apiKey
 		clientConfig.User = ""
 		clientConfig.Password = ""
+		clientConfig.RememberMe = false
 	}
 
 	client, err := unifi.NewClient(clientConfig)
