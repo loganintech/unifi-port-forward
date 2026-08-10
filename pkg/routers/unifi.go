@@ -19,6 +19,10 @@ import (
 type UnifiRouter struct {
 	SiteID string
 	Client unifi.Client
+
+	// usesAPIKey records which credential the client was built with. API key
+	// auth has no session to renew, so a 401 cannot be retried away.
+	usesAPIKey bool
 }
 
 func CreateUnifiRouter(baseURL, username, password, site, apiKey string) (*UnifiRouter, error) {
@@ -32,7 +36,12 @@ func CreateUnifiRouter(baseURL, username, password, site, apiKey string) (*Unifi
 	}
 
 	// override if using API key (recommended, requires UniFi Controller 9.0.108+)
-	if apiKey != "" {
+	//
+	// User, Password and RememberMe must be cleared, not merely ignored: the
+	// client validates them as `excluded_with=APIKey`, so leaving any of them set
+	// fails client creation outright under HardValidation.
+	usesAPIKey := apiKey != ""
+	if usesAPIKey {
 		clientConfig.APIKey = apiKey
 		clientConfig.User = ""
 		clientConfig.Password = ""
@@ -44,6 +53,7 @@ func CreateUnifiRouter(baseURL, username, password, site, apiKey string) (*Unifi
 		return nil, fmt.Errorf("failed to create client: %w", err)
 	}
 
+	// A no-op for API key auth, which authenticates per request instead.
 	err = client.Login()
 	if err != nil {
 		return nil, err
@@ -52,28 +62,44 @@ func CreateUnifiRouter(baseURL, username, password, site, apiKey string) (*Unifi
 	fmt.Printf("UniFi Controller Version: %s\n", client.Version())
 
 	router := &UnifiRouter{
-		SiteID: site,
-		Client: client,
+		SiteID:     site,
+		Client:     client,
+		usesAPIKey: usesAPIKey,
 	}
 
 	return router, nil
 }
 
-// withAuthRetry executes a function with automatic authentication retry on 401 errors
+// withAuthRetry executes a function, renewing the session and retrying once if
+// the router rejects it as unauthenticated.
+//
+// That recovery only applies to user/pass auth. An API key is sent on every
+// request and Login is a no-op for it, so retrying a 401 would re-issue the same
+// rejected request; the key itself is wrong, revoked, or lacks permission.
 func (router *UnifiRouter) withAuthRetry(ctx context.Context, operation string, fn func() error) error {
 	logger := ctrllog.FromContext(ctx)
 
 	err := fn()
+	if err == nil {
+		return nil
+	}
+
+	if serverErr, ok := err.(*unifi.ServerError); ok && serverErr.StatusCode == http.StatusUnauthorized {
+		if router.usesAPIKey {
+			logger.Error(err, "Router rejected the API key",
+				"operation", operation,
+				"hint", "check that UNIFI_API_KEY is current and its admin has network write permission")
+			return err
+		}
+
+		logger.Info("Renewing authentication to router", "operation", operation)
+		if loginErr := router.Client.Login(); loginErr == nil {
+			err = fn()
+		}
+	}
+
 	if err != nil {
-		if serverErr, ok := err.(*unifi.ServerError); ok && serverErr.StatusCode == http.StatusUnauthorized {
-			logger.Info("Renewing authentication to router", "operation", operation)
-			if loginErr := router.Client.Login(); loginErr == nil {
-				err = fn()
-			}
-		}
-		if err != nil {
-			logger.Error(err, "Operation failed after authentication retry", "operation", operation)
-		}
+		logger.Error(err, "Operation failed after authentication retry", "operation", operation)
 	}
 	return err
 }

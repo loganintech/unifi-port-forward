@@ -70,19 +70,30 @@ var rootCmd = &cobra.Command{
 			cfg.Debug, _ = cmd.Flags().GetBool("debug")
 		}
 
+		// Re-derive Host now that the flags have been applied. cfg.Load() already
+		// derived it from the environment, so without this a --router-ip flag
+		// updates RouterIP but the controller still connects to the old address.
+		cfg.SetDerivedValues()
+
 		// Validate final configuration
 		return cfg.Validate()
 	},
 }
 
 func init() {
-	// Global flags
-	rootCmd.PersistentFlags().StringVarP(&cfg.RouterIP, "router-ip", "r", "192.168.1.1", "UniFi router IP address (env: UNIFI_ROUTER_IP, default: 192.168.1.1)")
-	rootCmd.PersistentFlags().StringVarP(&cfg.Username, "username", "u", "admin", "UniFi username (env: UNIFI_USERNAME, default: admin)")
-	rootCmd.PersistentFlags().StringVarP(&cfg.Password, "password", "p", "", "UniFi password (env: UNIFI_PASSWORD, required)")
-	rootCmd.PersistentFlags().StringVarP(&cfg.Site, "site", "s", "default", "UniFi site name (env: UNIFI_SITE, default: default)")
-	rootCmd.PersistentFlags().StringVarP(&cfg.APIKey, "api-key", "k", "", "UniFi API key (env: UNIFI_API_KEY, alternative to username/password)")
-	rootCmd.PersistentFlags().BoolVarP(&cfg.Debug, "debug", "d", false, "Enable debug logging (env: DEBUG)")
+	// Global flags.
+	//
+	// These deliberately have their own storage rather than binding to cfg
+	// fields with StringVarP. A bound flag shares memory with the field, so
+	// cfg.Load() reading the environment would overwrite the parsed flag value
+	// and the "override with CLI flags" step below would read the environment
+	// value straight back - making every flag here silently lose to its env var.
+	rootCmd.PersistentFlags().StringP("router-ip", "r", "192.168.1.1", "UniFi router IP address (env: UNIFI_ROUTER_IP, default: 192.168.1.1)")
+	rootCmd.PersistentFlags().StringP("username", "u", "admin", "UniFi username (env: UNIFI_USERNAME, default: admin)")
+	rootCmd.PersistentFlags().StringP("password", "p", "", "UniFi password (env: UNIFI_PASSWORD, required unless --api-key is set)")
+	rootCmd.PersistentFlags().StringP("site", "s", "default", "UniFi site name (env: UNIFI_SITE, default: default)")
+	rootCmd.PersistentFlags().StringP("api-key", "k", "", "UniFi API key (env: UNIFI_API_KEY, alternative to username/password)")
+	rootCmd.PersistentFlags().BoolP("debug", "d", false, "Enable debug logging (env: DEBUG)")
 
 	// Add subcommands
 	rootCmd.AddCommand(controllerCmd)

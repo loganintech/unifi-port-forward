@@ -53,6 +53,23 @@ just test
 - `UNIFI_PASSWORD`: Router password
 - `UNIFI_API_KEY` : API key instead of user/pass. Untested(!)
 - `UNIFI_SITE`: UniFi site name (default: default)
+- `UNIFI_SYNC_INTERVAL`: Periodic reconcile interval (default: 15m, minimum 5m)
+- `DEBUG`: Enable debug logging (default: false)
+
+Every variable has a matching CLI flag (`--router-ip`, `--api-key`, …). Precedence is flag, then environment variable, then default.
+
+### Authentication
+
+Supply **either** an API key **or** a username and password — not both.
+
+| Using | Set | Leave unset |
+|---|---|---|
+| API key (recommended) | `UNIFI_API_KEY` | `UNIFI_USERNAME`, `UNIFI_PASSWORD` |
+| User/pass | `UNIFI_USERNAME`, `UNIFI_PASSWORD` | `UNIFI_API_KEY` |
+
+With an API key nothing else auth-related is needed. The client library validates username, password and "remember me" as mutually exclusive with an API key, so when `UNIFI_API_KEY` is set the controller clears the other three before building the client — setting them anyway is harmless but has no effect. The key is sent on every request; there is no login step and therefore no session to renew, so a 401 means the key is wrong, revoked, or lacks permission.
+
+API keys require UniFi OS 9.0.108 or newer. Create one under Settings → Admins → *your admin* → Create API Key.
 
 For authenticating, it is recommended to create a dedicated service account. Use role `Admin`, with full control to the network.
 
@@ -65,11 +82,14 @@ For authenticating, it is recommended to create a dedicated service account. Use
 
 
 **Deploy the annotation based Controller**
-Edit `manifests/deployment.yaml` and update the environment variables in the container spec.
+Edit `manifests/deployment.yaml`: set `UNIFI_ROUTER_IP` in the container spec, and put your credentials in the `Secret` at the bottom of the file (an `api-key`, or a `username`/`password` pair — delete whichever block you are not using).
 
 ```bash
+kubectl create namespace unifi-port-forward
 kubectl apply -f manifests/deployment.yaml
 ```
+
+The manifests are namespaced to `unifi-port-forward`; the Secret and ServiceAccount must live in the same namespace as the Deployment.
 
 **Test the controller by provisioning a test service**
 ``` bash
