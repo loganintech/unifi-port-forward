@@ -212,18 +212,8 @@ func (r *PeriodicReconciler) correctServiceDrift(ctx context.Context, analysis *
 		} else {
 			// Risky change: delete then recreate
 			operations = append(operations, PortOperation{
-				Type: OpDelete,
-				Config: routers.PortConfig{
-					// Copy from current rule for deletion
-					Name:      wrongRule.Current.Name,
-					DstPort:   helpers.ParseIntField(wrongRule.Current.DstPort),
-					FwdPort:   helpers.ParseIntField(wrongRule.Current.FwdPort),
-					DstIP:     wrongRule.Current.Fwd,
-					Protocol:  wrongRule.Current.Proto,
-					Enabled:   wrongRule.Current.Enabled,
-					Interface: wrongRule.Current.PfwdInterface,
-					SrcIP:     wrongRule.Current.Src,
-				},
+				Type:         OpDelete,
+				Config:       configFromRule(wrongRule.Current), // Copy from current rule for deletion
 				ExistingRule: wrongRule.Current,
 				Reason:       "drift_wrong_rule_delete",
 			})
@@ -239,17 +229,8 @@ func (r *PeriodicReconciler) correctServiceDrift(ctx context.Context, analysis *
 
 	for _, extraRule := range analysis.ExtraRules {
 		operations = append(operations, PortOperation{
-			Type: OpDelete,
-			Config: routers.PortConfig{
-				Name:      extraRule.Name,
-				DstPort:   helpers.ParseIntField(extraRule.DstPort),
-				FwdPort:   helpers.ParseIntField(extraRule.FwdPort),
-				DstIP:     extraRule.Fwd,
-				Protocol:  extraRule.Proto,
-				Enabled:   extraRule.Enabled,
-				Interface: extraRule.PfwdInterface,
-				SrcIP:     extraRule.Src,
-			},
+			Type:         OpDelete,
+			Config:       configFromRule(extraRule),
 			ExistingRule: extraRule,
 			Reason:       "drift_extra_rule",
 		})

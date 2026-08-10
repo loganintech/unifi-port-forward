@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -22,6 +21,7 @@ import (
 	"unifi-port-forward/pkg/config"
 	"unifi-port-forward/pkg/controller"
 	"unifi-port-forward/pkg/helpers"
+	"unifi-port-forward/pkg/ports"
 	"unifi-port-forward/pkg/routers"
 
 	corev1 "k8s.io/api/core/v1"
@@ -290,8 +290,10 @@ func parsePortMappingsString(mappingsStr string) (map[string]string, error) {
 		port := strings.TrimSpace(parts[0])
 		ip := strings.TrimSpace(parts[1])
 
-		// Validate port is numeric
-		if _, err := strconv.Atoi(port); err != nil {
+		// Validate the port spec - a single port or a range such as "8000-8100".
+		// Commas already separate mappings, so a list cannot be written here.
+		portSpec, err := ports.Parse(port)
+		if err != nil {
 			return nil, fmt.Errorf("invalid port number: %s", port)
 		}
 
@@ -300,7 +302,7 @@ func parsePortMappingsString(mappingsStr string) (map[string]string, error) {
 			return nil, fmt.Errorf("invalid IP address: %s", ip)
 		}
 
-		portMaps[port] = ip
+		portMaps[portSpec.String()] = ip
 	}
 
 	return portMaps, nil
@@ -372,8 +374,9 @@ func loadPortMappingsFromFile(filename string) (map[string]string, error) {
 
 	portMaps := make(map[string]string)
 	for _, mapping := range config.Mappings {
-		// Validate port
-		if _, err := strconv.Atoi(mapping.ExternalPort); err != nil {
+		// Validate the port spec - a single port, a range, or a list
+		portSpec, err := ports.Parse(mapping.ExternalPort)
+		if err != nil {
 			return nil, fmt.Errorf("invalid port number: %s", mapping.ExternalPort)
 		}
 
@@ -382,7 +385,7 @@ func loadPortMappingsFromFile(filename string) (map[string]string, error) {
 			return nil, fmt.Errorf("invalid IP address: %s", mapping.DestinationIP)
 		}
 
-		portMaps[mapping.ExternalPort] = mapping.DestinationIP
+		portMaps[portSpec.String()] = mapping.DestinationIP
 	}
 
 	return portMaps, nil

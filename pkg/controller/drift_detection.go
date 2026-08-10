@@ -3,12 +3,12 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/filipowm/go-unifi/unifi"
 	"unifi-port-forward/pkg/config"
 	"unifi-port-forward/pkg/helpers"
+	"unifi-port-forward/pkg/ports"
 	"unifi-port-forward/pkg/routers"
 
 	corev1 "k8s.io/api/core/v1"
@@ -125,19 +125,17 @@ func (d *DriftDetector) findMatchingRulesByPortAndProtocol(analysis *DriftAnalys
 	dstPortOnlyMap := make(map[string][]*unifi.PortForward) // one dstPort can have multiple rules with different fwdPorts
 
 	for _, rule := range allRouterRules {
-		dstPort := helpers.ParseIntField(rule.DstPort)
-		fwdPort := helpers.ParseIntField(rule.FwdPort)
-		exactKey := fmt.Sprintf("%d-%d-%s", dstPort, fwdPort, rule.Proto)
-		exactMatchMap[exactKey] = rule
+		dstPort := ports.ParseOrEmpty(rule.DstPort)
+		exactMatchMap[rulePortKey(rule)] = rule
 
-		dstPortOnlyKey := fmt.Sprintf("%d-%s", dstPort, rule.Proto)
+		dstPortOnlyKey := fmt.Sprintf("%s-%s", dstPort, rule.Proto)
 		dstPortOnlyMap[dstPortOnlyKey] = append(dstPortOnlyMap[dstPortOnlyKey], rule)
 	}
 
 	// Check each desired rule for potential ownership conflicts
 	for _, desiredRule := range analysis.DesiredRules {
-		exactKey := fmt.Sprintf("%d-%d-%s", desiredRule.DstPort, desiredRule.FwdPort, desiredRule.Protocol)
-		dstPortOnlyKey := fmt.Sprintf("%d-%s", desiredRule.DstPort, desiredRule.Protocol)
+		exactKey := portKey(desiredRule.DstPort, desiredRule.FwdPort, desiredRule.Protocol)
+		dstPortOnlyKey := fmt.Sprintf("%s-%s", desiredRule.DstPort, desiredRule.Protocol)
 
 		// First check for exact match (full dstPort+fwdPort+protocol match)
 		if existingRule, exists := exactMatchMap[exactKey]; exists {
@@ -193,7 +191,7 @@ func (d *DriftDetector) findMatchingRulesByPortAndProtocol(analysis *DriftAnalys
 					} else if existingRule.Enabled != desiredRule.Enabled {
 						shouldTakeOwnership = true
 						mismatchType = "enabled"
-					} else if existingRule.FwdPort != strconv.Itoa(desiredRule.FwdPort) {
+					} else if !ports.ParseOrEmpty(existingRule.FwdPort).Equal(desiredRule.FwdPort) {
 						// FwdPort mismatch - don't classify as WrongRule, let it be handled as Extra+Missing
 						// This allows proper DELETE+CREATE flow instead of WrongRule processing
 						continue
@@ -226,8 +224,7 @@ func (d *DriftDetector) analyzeDesiredVsCurrent(analysis *DriftAnalysis, process
 	// UniFi port forward rules are uniquely identified by DstPort+FwdPort+Protocol combination
 	desiredMap := make(map[string]routers.PortConfig)
 	for _, rule := range analysis.DesiredRules {
-		key := fmt.Sprintf("%d-%d-%s", rule.DstPort, rule.FwdPort, rule.Protocol)
-		desiredMap[key] = rule
+		desiredMap[portKey(rule.DstPort, rule.FwdPort, rule.Protocol)] = rule
 	}
 
 	// Build map of current rules by port+forwardport+protocol (only those belonging to this service)
@@ -240,10 +237,7 @@ func (d *DriftDetector) analyzeDesiredVsCurrent(analysis *DriftAnalysis, process
 			continue
 		}
 
-		dstPort := helpers.ParseIntField(rule.DstPort)
-		fwdPort := helpers.ParseIntField(rule.FwdPort)
-		key := fmt.Sprintf("%d-%d-%s", dstPort, fwdPort, rule.Proto)
-		currentMap[key] = rule
+		currentMap[rulePortKey(rule)] = rule
 	}
 
 	// Find missing rules (exist in desired but not current)

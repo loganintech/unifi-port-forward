@@ -3,7 +3,7 @@
 Rumour says that the Unifi Cloud Gateway Max finally supports BGP.
 A wiser man than I once quipped that automating ones router would be a fools errand. I wholeheartedly agree, but it does not change the fact that I also am a fool. And proud inventor of footguns everywhere.
 
-Kubernetes controllers are fun. This controller will look for any `Gateway` or `LoadBalancer` objects annotated with `unifi-port-forward.fiskhe.st/mapping`. A mapping is one or more `key:value` pairs (comma-separated) of the externally facing port mapped to the service that the port forward should forward the traffic to.
+Kubernetes controllers are fun. This controller will look for any `Gateway` or `LoadBalancer` objects annotated with `unifi-port-forward.fiskhe.st/mapping`. A mapping is one or more `key:value` pairs (comma-separated) of the externally facing port mapped to the service that the port forward should forward the traffic to. The external side may be a single port, an inclusive range (`27015-27020:game`), or a list.
 
 On first startup, the controller will check all services and then inspect the currently provisioned Port Forward rules on the Unifi router, either updating or ensuring that port forward rules match with the service object spec and annotation rule. Thereafter, it will periodically reconcile on a schedule ensuring router port forward rules weren't brought out of sync by some other means.
 
@@ -13,6 +13,7 @@ The controller does not delete other rules (as long as they don't use conflictin
 - Real-time monitoring of kubernetes LoadBalancer services, automatically configuring corresponding port forward rules on a UniFi router.
 - Pre-created rules not maintained by this controller **stays untouched** (as long as there are no conflicts). Only manages services with valid annotations.
 - Support for multiple rules per service or gateway
+- Port ranges and port lists, both in annotations and in the `PortForwardRule` CRD
 - Periodic reconciliation for state drift detection
 - Publishes kubernetes events for improved observability
 - Can create port forwards using CRDs for services that are managed outside of kubernetes
@@ -90,11 +91,20 @@ kubectl apply -f manifests/crd
 ```
 
 There are two types of CRD-based port forward rules, serviceref and standalone.
-Serviceref makes a mapping to a running kubernetes service, while standalone can be used to create port forward for external services
+Serviceref makes a mapping to a running kubernetes service, while standalone can be used to create port forward for external services.
+With serviceref, both the destination IP and the internal port are resolved from the Service, so `destinationPort` is only used by standalone rules.
 ``` bash
 kubectl apply -f examples/crds/portforwardrule-serviceref.yaml
 kubectl apply -f examples/crds/portforwardrule-standalone.yaml
 ```
+
+`externalPort` (and `destinationPort`) accept a bare number, an inclusive range, or a comma-separated list of either. Ranges and lists must be quoted so they parse as strings:
+``` yaml
+externalPort: 25565          # single port
+externalPort: "27015-27020"  # range
+externalPort: "80,443"       # list
+```
+UniFi accepts at most 15 comma-separated elements per rule. See [examples/crds/portforwardrule-range.yaml](examples/crds/portforwardrule-range.yaml).
 
 ## Automated Deployment
 
