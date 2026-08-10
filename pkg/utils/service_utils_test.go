@@ -171,6 +171,84 @@ func TestGetPortConfigsPortSpecs(t *testing.T) {
 	}
 }
 
+func nodePortService(annotation string, servicePorts ...v1.ServicePort) *v1.Service {
+	service := serviceWithPorts(annotation, servicePorts...)
+	service.Spec.Type = v1.ServiceTypeNodePort
+	return service
+}
+
+func TestGetPortConfigsNodePortForwardsToNodePort(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotation  string
+		servicePort v1.ServicePort
+		wantDst     string
+		wantFwd     string
+	}{
+		{
+			name:        "single external port forwards to the nodePort",
+			annotation:  "8080:http",
+			servicePort: v1.ServicePort{Name: "http", Port: 80, NodePort: 31234, Protocol: v1.ProtocolTCP},
+			wantDst:     "8080",
+			wantFwd:     "31234",
+		},
+		{
+			name:        "bare name uses the service port externally, nodePort internally",
+			annotation:  "http",
+			servicePort: v1.ServicePort{Name: "http", Port: 80, NodePort: 31234, Protocol: v1.ProtocolTCP},
+			wantDst:     "80",
+			wantFwd:     "31234",
+		},
+		{
+			// nodePorts are allocated one at a time and are not contiguous, so a
+			// range must not be offset onto nodePort..nodePort+N.
+			name:        "range collapses onto the single nodePort",
+			annotation:  "27015-27020:game",
+			servicePort: v1.ServicePort{Name: "game", Port: 27015, NodePort: 31234, Protocol: v1.ProtocolUDP},
+			wantDst:     "27015-27020",
+			wantFwd:     "31234",
+		},
+		{
+			name:        "list collapses onto the single nodePort",
+			annotation:  "80:web,443:web",
+			servicePort: v1.ServicePort{Name: "web", Port: 8080, NodePort: 31500, Protocol: v1.ProtocolTCP},
+			wantDst:     "80,443",
+			wantFwd:     "31500",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ClearPortConflictTracking()
+
+			service := nodePortService(tt.annotation, tt.servicePort)
+			configs, err := GetPortConfigs(service, "192.168.1.21", testAnnotation)
+			if err != nil {
+				t.Fatalf("GetPortConfigs returned error: %v", err)
+			}
+			if len(configs) != 1 {
+				t.Fatalf("got %d configs, want 1: %+v", len(configs), configs)
+			}
+
+			if got := configs[0].DstPort.String(); got != tt.wantDst {
+				t.Errorf("DstPort = %q, want %q", got, tt.wantDst)
+			}
+			if got := configs[0].FwdPort.String(); got != tt.wantFwd {
+				t.Errorf("FwdPort = %q, want %q", got, tt.wantFwd)
+			}
+		})
+	}
+}
+
+func TestGetPortConfigsNodePortWithoutAllocatedNodePort(t *testing.T) {
+	ClearPortConflictTracking()
+
+	service := nodePortService("8080:http", v1.ServicePort{Name: "http", Port: 80, Protocol: v1.ProtocolTCP})
+	if _, err := GetPortConfigs(service, "192.168.1.21", testAnnotation); err == nil {
+		t.Error("expected an error when the nodePort has not been allocated yet")
+	}
+}
+
 func TestGetPortConfigsRangeRunningPastMaxPort(t *testing.T) {
 	ClearPortConflictTracking()
 

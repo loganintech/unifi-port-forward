@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"unifi-port-forward/pkg/config"
+	"unifi-port-forward/pkg/destination"
 	"unifi-port-forward/pkg/helpers"
 	"unifi-port-forward/pkg/ports"
 	"unifi-port-forward/pkg/routers"
@@ -103,11 +104,24 @@ func (r *PortForwardReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	lbIP := helpers.GetLBIP(service)
-
-	if lbIP == "" {
+	dest, destErr := resolveServiceDestination(ctx, r.Client, service)
+	if destErr != nil {
+		// An unsupported type is a permanent misconfiguration, so say so once and
+		// stop. Anything else - no LB IP yet, no Ready node - is transient and
+		// resolves on a later event or the periodic pass.
+		if destination.IsUnsupportedType(destErr) && hasPortForwardAnnotation(service) {
+			logger.Info("Service type cannot be port forwarded, skipping",
+				"service_type", service.Spec.Type, "reason", destErr.Error())
+			if r.Recorder != nil {
+				r.Recorder.Event(service, corev1.EventTypeWarning, "UnsupportedServiceType", destErr.Error())
+			}
+		} else {
+			logger.V(1).Info("No destination address for service yet, skipping",
+				"service_type", service.Spec.Type, "reason", destErr.Error())
+		}
 		return ctrl.Result{}, nil
 	}
+	lbIP := dest.IP
 
 	// Check if service needs port forwarding and add finalizer if needed
 	shouldManage := r.shouldProcessService(ctx, service, lbIP)
@@ -279,7 +293,7 @@ func (r *PortForwardReconciler) shouldProcessService(ctx context.Context, servic
 func (r *PortForwardReconciler) processAllChanges(ctx context.Context, service *corev1.Service, changeContext *ChangeContext, currentRules []*unifi.PortForward) ([]PortOperation, ctrl.Result, error) {
 	logger := ctrllog.FromContext(ctx)
 	// Step 1: Determine desired end state
-	desiredConfigs, err := r.calculateDesiredState(service)
+	desiredConfigs, err := r.calculateDesiredState(ctx, service)
 	if err != nil {
 		logger.Error(err, "calculating desired state while processing all changes")
 
@@ -328,7 +342,7 @@ func (r *PortForwardReconciler) processAllChanges(ctx context.Context, service *
 	// Publish events for successful operations
 	if r.EventPublisher != nil && len(result.Created) > 0 {
 		for _, created := range result.Created {
-			lbIP := helpers.GetLBIP(service)
+			lbIP := serviceDestinationIP(ctx, r.Client, service)
 			portName := helpers.GetPortNameByNumber(service, created.FwdPort.Low())
 			r.EventPublisher.PublishPortForwardCreatedEvent(ctx, service,
 				portName, fmt.Sprintf("%s:%s", created.DstPort, created.FwdPort),
@@ -337,7 +351,7 @@ func (r *PortForwardReconciler) processAllChanges(ctx context.Context, service *
 
 		// Publish update events
 		for _, updated := range result.Updated {
-			lbIP := helpers.GetLBIP(service)
+			lbIP := serviceDestinationIP(ctx, r.Client, service)
 			r.EventPublisher.PublishPortForwardUpdatedEvent(ctx, service, updated.Name,
 				fmt.Sprintf("%s:%s", updated.DstPort, updated.FwdPort),
 				lbIP, updated.DstIP, updated.DstPort, updated.Protocol, "RulesUpdatedSuccessfully")
@@ -457,7 +471,7 @@ func (r *PortForwardReconciler) finalizeService(ctx context.Context, service *co
 
 // detectChanges determines what changes are needed using fresh router state
 func (r *PortForwardReconciler) detectChanges(ctx context.Context, service *corev1.Service, serviceKey string, allCurrentRules []*unifi.PortForward) *ChangeContext {
-	lbIP := helpers.GetLBIP(service)
+	lbIP := serviceDestinationIP(ctx, r.Client, service)
 
 	// Filter current rules for this specific service from fresh router data
 	var currentRules []*unifi.PortForward
@@ -497,7 +511,7 @@ func (r *PortForwardReconciler) detectChanges(ctx context.Context, service *core
 	}
 
 	// Calculate desired state for optimization comparison
-	desiredConfigs, err := r.calculateDesiredState(service)
+	desiredConfigs, err := r.calculateDesiredState(ctx, service)
 	if err != nil {
 		// Log error but don't fail - fall back to IP-based detection
 		ctrllog.FromContext(ctx).Error(err, "Failed to calculate desired state for optimization")

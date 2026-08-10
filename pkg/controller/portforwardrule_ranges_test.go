@@ -13,6 +13,7 @@ import (
 
 	"unifi-port-forward/pkg/api/v1alpha1"
 	"unifi-port-forward/pkg/config"
+	"unifi-port-forward/pkg/destination"
 	"unifi-port-forward/pkg/ports"
 	"unifi-port-forward/pkg/routers"
 	"unifi-port-forward/testutils"
@@ -119,6 +120,98 @@ func TestGetServiceDestinationDerivesInternalPorts(t *testing.T) {
 				t.Errorf("destination ports = %q, want %q", got, tt.wantPorts)
 			}
 		})
+	}
+}
+
+// nodePortService builds a NodePort Service with a single named port. It gets no
+// LoadBalancer ingress, so the address has to come from the dst-ip annotation or
+// node discovery.
+func nodePortService(name, namespace, portName string, port, nodePort int32, dstIP string) *corev1.Service {
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{
+				{Name: portName, Port: port, NodePort: nodePort, Protocol: corev1.ProtocolTCP},
+			},
+		},
+	}
+	if dstIP != "" {
+		service.Annotations = map[string]string{destination.IPAnnotation: dstIP}
+	}
+	return service
+}
+
+func TestGetServiceDestinationNodePort(t *testing.T) {
+	tests := []struct {
+		name          string
+		externalPorts string
+		wantPorts     string
+	}{
+		{
+			name:          "single external port forwards to the nodePort",
+			externalPorts: "8080",
+			wantPorts:     "31234",
+		},
+		{
+			// nodePorts are not contiguous, so a range cannot be offset onto them.
+			name:          "range collapses onto the single nodePort",
+			externalPorts: "27015-27020",
+			wantPorts:     "31234",
+		},
+		{
+			name:          "list collapses onto the single nodePort",
+			externalPorts: "80,443",
+			wantPorts:     "31234",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service := nodePortService("web", "default", "http", 80, 31234, "192.168.1.21")
+			reconciler, _ := newRuleReconciler(t, service)
+
+			rule := &v1alpha1.PortForwardRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "rule", Namespace: "default"},
+				Spec: v1alpha1.PortForwardRuleSpec{
+					ExternalPort: intstr.FromString(tt.externalPorts),
+					Protocol:     "tcp",
+					ServiceRef:   &v1alpha1.ServiceReference{Name: "web", Port: "http"},
+				},
+			}
+
+			destIP, destPorts, err := reconciler.getServiceDestination(
+				context.Background(), rule, ports.MustParse(tt.externalPorts))
+			if err != nil {
+				t.Fatalf("getServiceDestination returned error: %v", err)
+			}
+
+			if destIP != "192.168.1.21" {
+				t.Errorf("destination IP = %q, want the annotated node address 192.168.1.21", destIP)
+			}
+			if got := destPorts.String(); got != tt.wantPorts {
+				t.Errorf("destination ports = %q, want %q", got, tt.wantPorts)
+			}
+		})
+	}
+}
+
+func TestGetServiceDestinationNodePortWithoutAllocatedNodePort(t *testing.T) {
+	service := nodePortService("web", "default", "http", 80, 0, "192.168.1.21")
+	reconciler, _ := newRuleReconciler(t, service)
+
+	rule := &v1alpha1.PortForwardRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "rule", Namespace: "default"},
+		Spec: v1alpha1.PortForwardRuleSpec{
+			ExternalPort: intstr.FromInt32(8080),
+			Protocol:     "tcp",
+			ServiceRef:   &v1alpha1.ServiceReference{Name: "web", Port: "http"},
+		},
+	}
+
+	if _, _, err := reconciler.getServiceDestination(
+		context.Background(), rule, ports.FromPort(8080)); err == nil {
+		t.Error("expected an error when the nodePort has not been allocated yet")
 	}
 }
 

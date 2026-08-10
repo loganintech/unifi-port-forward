@@ -3,17 +3,20 @@
 Rumour says that the Unifi Cloud Gateway Max finally supports BGP.
 A wiser man than I once quipped that automating ones router would be a fools errand. I wholeheartedly agree, but it does not change the fact that I also am a fool. And proud inventor of footguns everywhere.
 
-Kubernetes controllers are fun. This controller will look for any `Gateway` or `LoadBalancer` objects annotated with `unifi-port-forward.fiskhe.st/mapping`. A mapping is one or more `key:value` pairs (comma-separated) of the externally facing port mapped to the service that the port forward should forward the traffic to. The external side may be a single port, an inclusive range (`27015-27020:game`), or a list.
+Kubernetes controllers are fun. This controller will look for any `Gateway`, `LoadBalancer` or `NodePort` objects annotated with `unifi-port-forward.fiskhe.st/mapping`. A mapping is one or more `key:value` pairs (comma-separated) of the externally facing port mapped to the service that the port forward should forward the traffic to. The external side may be a single port, an inclusive range (`27015-27020:game`), or a list.
+
+A `LoadBalancer` service forwards to its ingress IP; a `NodePort` service forwards to a node address and the allocated nodePort. `ClusterIP` is not supported, since a cluster IP is not routable from the router. See [examples/README.md](examples/README.md#service-types) for how the node is chosen and how to pin it.
 
 On first startup, the controller will check all services and then inspect the currently provisioned Port Forward rules on the Unifi router, either updating or ensuring that port forward rules match with the service object spec and annotation rule. Thereafter, it will periodically reconcile on a schedule ensuring router port forward rules weren't brought out of sync by some other means.
 
 The controller does not delete other rules (as long as they don't use conflicting names) and has a small footprint.
 
 ## Core Features
-- Real-time monitoring of kubernetes LoadBalancer services, automatically configuring corresponding port forward rules on a UniFi router.
+- Real-time monitoring of kubernetes LoadBalancer and NodePort services, automatically configuring corresponding port forward rules on a UniFi router.
 - Pre-created rules not maintained by this controller **stays untouched** (as long as there are no conflicts). Only manages services with valid annotations.
 - Support for multiple rules per service or gateway
 - Port ranges and port lists, both in annotations and in the `PortForwardRule` CRD
+- `NodePort` services forward to a node address and the allocated nodePort, with the node discovered automatically or pinned via annotation
 - Periodic reconciliation for state drift detection
 - Publishes kubernetes events for improved observability
 - Can create port forwards using CRDs for services that are managed outside of kubernetes
@@ -61,7 +64,8 @@ For authenticating, it is recommended to create a dedicated service account. Use
 **Prerequisites**
 - A namespace (the default configured in these manifests: `unifi-port-forward`)
 - A router with provisioned credentials
-- A functional LoadBalancer implementation that assigns valid IP addresses to Service LoadBalancer objects
+- For LoadBalancer services: a functional LoadBalancer implementation that assigns valid IP addresses to Service LoadBalancer objects
+- For NodePort services: `get`/`list`/`watch` on `nodes` (granted by `manifests/deployment.yaml`), or the `unifi-port-forward.fiskhe.st/dst-ip` annotation on each service. **Upgrading from an earlier version? Re-apply the manifests to pick up the new node permission.**
 
 
 **Deploy the annotation based Controller**

@@ -15,7 +15,11 @@ type PortMapping struct {
 	ExternalPorts ports.Spec // External port(s) (DstPort); empty means "use the service port"
 }
 
-// GetLBIP extracts the LoadBalancer IP from a service
+// GetLBIP extracts the LoadBalancer ingress IP from a service.
+//
+// This is a narrow lookup for LoadBalancer services only. To find where a
+// service's traffic should be forwarded - which for a NodePort service means a
+// node address - use the destination package instead.
 func GetLBIP(service *v1.Service) string {
 	if len(service.Status.LoadBalancer.Ingress) > 0 {
 		for _, ingress := range service.Status.LoadBalancer.Ingress {
@@ -99,28 +103,55 @@ func parseSingleMapping(mapping string) (PortMapping, error) {
 	}
 }
 
-// resolvePortSpecs derives the external and forward port specs for one mapped service port.
+// forwardBasePort is the internal port traffic should be handed to.
 //
-//   - a single external port forwards to the service port, as it always has
+// A LoadBalancer service is reached on its own address at the service port. A
+// NodePort service is reached through a node, which listens on the allocated
+// nodePort instead.
+func forwardBasePort(service *v1.Service, servicePort v1.ServicePort) (int, error) {
+	if service.Spec.Type != v1.ServiceTypeNodePort {
+		return int(servicePort.Port), nil
+	}
+	if servicePort.NodePort == 0 {
+		return 0, fmt.Errorf("port %q of NodePort service %s/%s has no nodePort allocated yet",
+			servicePort.Name, service.Namespace, service.Name)
+	}
+	return int(servicePort.NodePort), nil
+}
+
+// externalSpec is the WAN-side spec for a mapping. A mapping written as a bare
+// port name carries no ports of its own and defaults to the service port - the
+// number users think of as the service's port, even for a NodePort service
+// where traffic actually arrives on a nodePort.
+func externalSpec(mapping PortMapping, servicePort int) ports.Spec {
+	if mapping.ExternalPorts.IsEmpty() {
+		return ports.FromPort(servicePort)
+	}
+	return mapping.ExternalPorts
+}
+
+// forwardSpec derives the internal ports traffic is handed to.
+//
+//   - a single external port forwards to the base port, as it always has
 //   - a contiguous external range forwards to a same-sized range starting at the
-//     service port, so "8000-8100:game" on a service port of 8000 preserves ports
-//   - a discontinuous external list forwards every one of its ports to the
-//     service port, so "80:https,443:https" on a service port of 443 collapses
-func resolvePortSpecs(mapping PortMapping, servicePort int) (ports.Spec, ports.Spec, error) {
-	external := mapping.ExternalPorts
-	if external.IsEmpty() {
-		external = ports.FromPort(servicePort)
+//     base port, so "8000-8100:game" on a service port of 8000 preserves ports
+//   - a discontinuous external list forwards every one of its ports to the base
+//     port, so "80:https,443:https" on a service port of 443 collapses
+//
+// offsetRanges is false for NodePort services. nodePorts are allocated one at a
+// time and are not contiguous, so mapping a range onto nodePort..nodePort+N
+// would point at ports nothing is listening on; multi-port specs collapse onto
+// the single nodePort instead.
+func forwardSpec(external ports.Spec, basePort int, offsetRanges bool) (ports.Spec, error) {
+	if external.IsSinglePort() || !external.IsContiguous() || !offsetRanges {
+		return ports.FromPort(basePort), nil
 	}
 
-	if external.IsSinglePort() || !external.IsContiguous() {
-		return external, ports.FromPort(servicePort), nil
-	}
-
-	forward, err := ports.ContiguousFrom(servicePort, external.Count())
+	forward, err := ports.ContiguousFrom(basePort, external.Count())
 	if err != nil {
-		return ports.Spec{}, ports.Spec{}, fmt.Errorf("cannot forward external ports %s to service port %d: %w", external, servicePort, err)
+		return ports.Spec{}, fmt.Errorf("cannot forward external ports %s to port %d: %w", external, basePort, err)
 	}
-	return external, forward, nil
+	return forward, nil
 }
 
 // validatePortMappings validates that all mapped port names exist in service and no conflicts
@@ -156,10 +187,7 @@ func validatePortMappings(service *v1.Service, mappings []PortMapping) error {
 				continue
 			}
 
-			external, _, err := resolvePortSpecs(mapping, int(port.Port))
-			if err != nil {
-				return err
-			}
+			external := externalSpec(mapping, int(port.Port))
 
 			for _, existing := range claims {
 				if existing.external.Overlaps(external) {
@@ -198,8 +226,11 @@ func GetServicePortByName(service *v1.Service, portName string) *v1.ServicePort 
 	return nil
 }
 
-// GetPortConfigs creates multiple PortConfigs from a service (supports multiple ports)
-func GetPortConfigs(service *v1.Service, lbIP, annotationKey string) ([]routers.PortConfig, error) {
+// GetPortConfigs creates multiple PortConfigs from a service (supports multiple ports).
+//
+// destIP is the already-resolved forwarding address: a LoadBalancer ingress IP,
+// or a node address for a NodePort service.
+func GetPortConfigs(service *v1.Service, destIP, annotationKey string) ([]routers.PortConfig, error) {
 	serviceKey := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
 
 	// Parse annotation
@@ -239,7 +270,13 @@ func GetPortConfigs(service *v1.Service, lbIP, annotationKey string) ([]routers.
 			continue
 		}
 
-		externalPorts, forwardPorts, err := resolvePortSpecs(matched, int(servicePort.Port))
+		basePort, err := forwardBasePort(service, servicePort)
+		if err != nil {
+			return nil, err
+		}
+
+		externalPorts := externalSpec(matched, int(servicePort.Port))
+		forwardPorts, err := forwardSpec(externalPorts, basePort, service.Spec.Type != v1.ServiceTypeNodePort)
 		if err != nil {
 			return nil, err
 		}
@@ -260,7 +297,7 @@ func GetPortConfigs(service *v1.Service, lbIP, annotationKey string) ([]routers.
 			FwdPort:   forwardPorts,  // Internal service port(s)
 			Enabled:   true,
 			Interface: "wan",
-			DstIP:     lbIP,
+			DstIP:     destIP,
 			SrcIP:     "any",
 			Protocol:  protocol,
 		})
