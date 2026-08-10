@@ -113,7 +113,7 @@ This project uses GitHub Actions for continuous integration and automated Docker
 ### CI/CD Pipeline
 
 - **Trigger**: Automatic on push to `main` branch
-- **Registry**: `ghcr.io/fiskhest/unifi-port-forward` (public)
+- **Registry**: `ghcr.io/<owner>/<repo>`, derived from the repository the workflow runs in — `ghcr.io/fiskhest/unifi-port-forward` (public) here, and a fork's own namespace in a fork. Nothing to edit after forking, and nothing fork-specific to strip out of a pull request.
 - **Tagging**: 
   - `latest` - Always points to the latest build
   - `YYYY-MM-DD-commit` - Unique tag per build (e.g., `2025-01-30-a1b2c3d`)
@@ -134,6 +134,17 @@ Build and push locally using the justfile:
 ```bash
 just build
 ```
+
+This runs `docker buildx bake --push` and publishes to the `REGISTRY` default in
+`docker-bake.hcl`. Override it to publish somewhere else — useful from a fork, so
+a local build does not try to push to this repository's registry:
+
+```bash
+REGISTRY=ghcr.io/you/unifi-port-forward just build
+```
+
+The justfile loads a local `.env` (gitignored), so `REGISTRY=ghcr.io/you/unifi-port-forward`
+in that file makes the override stick without repeating it.
 
 ## Contributing
 
