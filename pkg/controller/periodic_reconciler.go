@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"unifi-port-forward/pkg/config"
-	"unifi-port-forward/pkg/helpers"
 	"unifi-port-forward/pkg/routers"
 
 	corev1 "k8s.io/api/core/v1"
@@ -289,7 +288,7 @@ func (r *PeriodicReconciler) getAllManagedServices(ctx context.Context) ([]*core
 	for i := range services.Items {
 		service := &services.Items[i]
 
-		if r.shouldManageService(service) {
+		if r.shouldManageService(ctx, service) {
 			managedServices = append(managedServices, service)
 		}
 	}
@@ -302,7 +301,7 @@ func (r *PeriodicReconciler) getAllManagedServices(ctx context.Context) ([]*core
 }
 
 // shouldManageService checks if a service should be managed by the periodic reconciler
-func (r *PeriodicReconciler) shouldManageService(service *corev1.Service) bool {
+func (r *PeriodicReconciler) shouldManageService(ctx context.Context, service *corev1.Service) bool {
 	annotations := service.GetAnnotations()
 	if annotations == nil {
 		return false
@@ -313,6 +312,7 @@ func (r *PeriodicReconciler) shouldManageService(service *corev1.Service) bool {
 		return false
 	}
 
-	lbIP := helpers.GetLBIP(service)
-	return lbIP != ""
+	// A service is only manageable once we can say where its traffic should go.
+	// For NodePort that means resolving a node, so this needs the cluster.
+	return serviceDestinationIP(ctx, r.Client, service) != ""
 }

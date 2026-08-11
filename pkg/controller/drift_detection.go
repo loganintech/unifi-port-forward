@@ -74,7 +74,7 @@ func (d *DriftDetector) analyzeServiceDrift(ctx context.Context, service *corev1
 	}
 
 	// 1. Get desired rules for this service
-	desiredRules, err := d.calculateDesiredRulesForService(service)
+	desiredRules, err := d.calculateDesiredRulesForService(ctx, service)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate desired rules: %w", err)
 	}
@@ -98,13 +98,13 @@ func (d *DriftDetector) analyzeServiceDrift(ctx context.Context, service *corev1
 }
 
 // calculateDesiredRulesForService calculates desired port configurations for a service
-func (d *DriftDetector) calculateDesiredRulesForService(service *corev1.Service) ([]routers.PortConfig, error) {
-	lbIP := helpers.GetLBIP(service)
-	if lbIP == "" {
-		return nil, fmt.Errorf("service has no LoadBalancer IP")
+func (d *DriftDetector) calculateDesiredRulesForService(ctx context.Context, service *corev1.Service) ([]routers.PortConfig, error) {
+	dest, err := resolveServiceDestination(ctx, d.Client, service)
+	if err != nil {
+		return nil, err
 	}
 
-	portConfigs, err := helpers.GetPortConfigs(service, lbIP, config.FilterAnnotation)
+	portConfigs, err := helpers.GetPortConfigs(service, dest.IP, config.FilterAnnotation)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get port configurations: %w", err)
 	}

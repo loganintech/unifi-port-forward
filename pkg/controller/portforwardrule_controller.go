@@ -278,13 +278,19 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 }
 
 // getServiceDestination gets the destination IP and port(s) from a service
-// reference. The internal ports are derived from the Service, so a rule using
-// serviceRef never has to name a destination port itself:
+// reference. Both are derived from the Service, so a rule using serviceRef never
+// has to name a destination port itself.
 //
-//   - a single external port forwards to the service port
-//   - a contiguous external range forwards to a same-sized range starting at the
-//     service port, preserving the offset of each port
-//   - a discontinuous external list forwards all of its ports to the service port
+// The address depends on how the Service is exposed - a LoadBalancer ingress IP,
+// or a node's address for a NodePort service. The internal ports follow:
+//
+//   - a single external port forwards to the service port (nodePort for NodePort)
+//   - a contiguous external range forwards to a same-sized range starting there,
+//     preserving the offset of each port
+//   - a discontinuous external list forwards all of its ports to the single port
+//
+// The range offset is skipped for NodePort services, whose nodePorts are
+// allocated individually and are not contiguous.
 func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, rule *v1alpha1.PortForwardRule, externalPorts ports.Spec) (string, ports.Spec, error) {
 	namespace := rule.Namespace
 	if rule.Spec.ServiceRef.Namespace != nil {
@@ -296,35 +302,37 @@ func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, r
 		return "", ports.Spec{}, fmt.Errorf("failed to get service: %w", err)
 	}
 
-	var destIP string
-	if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
-		for _, ingress := range service.Status.LoadBalancer.Ingress {
-			if ingress.IP != "" {
-				destIP = ingress.IP
-				break
-			}
-		}
+	dest, err := resolveServiceDestination(ctx, r.Client, &service)
+	if err != nil {
+		return "", ports.Spec{}, err
 	}
 
-	if destIP == "" {
-		return "", ports.Spec{}, fmt.Errorf("service %s/%s has no LoadBalancer IP", namespace, rule.Spec.ServiceRef.Name)
-	}
-
-	// Find the service port
-	var destPort int
-	for _, port := range service.Spec.Ports {
+	// Find the referenced service port
+	var servicePort *corev1.ServicePort
+	for i, port := range service.Spec.Ports {
 		if port.Name == rule.Spec.ServiceRef.Port || fmt.Sprintf("%d", port.Port) == rule.Spec.ServiceRef.Port {
-			destPort = int(port.Port)
+			servicePort = &service.Spec.Ports[i]
 			break
 		}
 	}
 
-	if destPort == 0 {
+	if servicePort == nil {
 		return "", ports.Spec{}, fmt.Errorf("port %s not found in service %s/%s", rule.Spec.ServiceRef.Port, namespace, rule.Spec.ServiceRef.Name)
 	}
 
-	if externalPorts.IsSinglePort() || !externalPorts.IsContiguous() {
-		return destIP, ports.FromPort(destPort), nil
+	destPort := int(servicePort.Port)
+	offsetRanges := true
+	if service.Spec.Type == corev1.ServiceTypeNodePort {
+		if servicePort.NodePort == 0 {
+			return "", ports.Spec{}, fmt.Errorf("port %s of NodePort service %s/%s has no nodePort allocated yet",
+				rule.Spec.ServiceRef.Port, namespace, rule.Spec.ServiceRef.Name)
+		}
+		destPort = int(servicePort.NodePort)
+		offsetRanges = false
+	}
+
+	if externalPorts.IsSinglePort() || !externalPorts.IsContiguous() || !offsetRanges {
+		return dest.IP, ports.FromPort(destPort), nil
 	}
 
 	destPorts, err := ports.ContiguousFrom(destPort, externalPorts.Count())
@@ -332,7 +340,7 @@ func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, r
 		return "", ports.Spec{}, fmt.Errorf("cannot forward external ports %s to service %s/%s port %d: %w",
 			externalPorts, namespace, rule.Spec.ServiceRef.Name, destPort, err)
 	}
-	return destIP, destPorts, nil
+	return dest.IP, destPorts, nil
 }
 
 // updateRuleStatusWithRetry updates status of PortForwardRule with retry logic for conflicts

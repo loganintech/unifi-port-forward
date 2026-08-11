@@ -19,8 +19,8 @@ func GetLBIP(service *v1.Service) string {
 }
 
 // GetPortConfigs creates multiple PortConfigs from a service using utils package
-func GetPortConfigs(service *v1.Service, lbIP string, annotationKey string) ([]routers.PortConfig, error) {
-	return utils.GetPortConfigs(service, lbIP, annotationKey)
+func GetPortConfigs(service *v1.Service, destIP string, annotationKey string) ([]routers.PortConfig, error) {
+	return utils.GetPortConfigs(service, destIP, annotationKey)
 }
 
 // UnmarkPortUsed removes external ports from tracking using utils package

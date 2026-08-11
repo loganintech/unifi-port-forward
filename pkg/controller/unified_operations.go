@@ -447,14 +447,14 @@ func (r *PortForwardReconciler) rollbackCleanupOperations(ctx context.Context, o
 }
 
 // calculateDesiredState generates the desired port configurations for a service
-func (r *PortForwardReconciler) calculateDesiredState(service *corev1.Service) ([]routers.PortConfig, error) {
-	lbIP := helpers.GetLBIP(service)
-	if lbIP == "" {
-		return nil, fmt.Errorf("service has no LoadBalancer IP")
+func (r *PortForwardReconciler) calculateDesiredState(ctx context.Context, service *corev1.Service) ([]routers.PortConfig, error) {
+	dest, err := resolveServiceDestination(ctx, r.Client, service)
+	if err != nil {
+		return nil, err
 	}
 
 	// Get port configurations from annotations
-	portConfigs, err := helpers.GetPortConfigs(service, lbIP, config.FilterAnnotation)
+	portConfigs, err := helpers.GetPortConfigs(service, dest.IP, config.FilterAnnotation)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get port configurations: %w", err)
 	}
