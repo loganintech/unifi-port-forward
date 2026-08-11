@@ -107,16 +107,19 @@ func TestGetServiceDestinationDerivesInternalPorts(t *testing.T) {
 				},
 			}
 
-			destIP, destPorts, err := reconciler.getServiceDestination(
+			bindings, err := reconciler.getServiceDestinations(
 				context.Background(), rule, ports.MustParse(tt.externalPorts))
 			if err != nil {
-				t.Fatalf("getServiceDestination returned error: %v", err)
+				t.Fatalf("getServiceDestinations returned error: %v", err)
 			}
 
-			if destIP != "192.168.1.50" {
-				t.Errorf("destination IP = %q, want 192.168.1.50", destIP)
+			if len(bindings) != 1 {
+				t.Fatalf("got %d bindings, want 1", len(bindings))
 			}
-			if got := destPorts.String(); got != tt.wantPorts {
+			if bindings[0].IP != "192.168.1.50" {
+				t.Errorf("destination IP = %q, want 192.168.1.50", bindings[0].IP)
+			}
+			if got := bindings[0].Ports.String(); got != tt.wantPorts {
 				t.Errorf("destination ports = %q, want %q", got, tt.wantPorts)
 			}
 		})
@@ -180,16 +183,19 @@ func TestGetServiceDestinationNodePort(t *testing.T) {
 				},
 			}
 
-			destIP, destPorts, err := reconciler.getServiceDestination(
+			bindings, err := reconciler.getServiceDestinations(
 				context.Background(), rule, ports.MustParse(tt.externalPorts))
 			if err != nil {
-				t.Fatalf("getServiceDestination returned error: %v", err)
+				t.Fatalf("getServiceDestinations returned error: %v", err)
 			}
 
-			if destIP != "192.168.1.21" {
-				t.Errorf("destination IP = %q, want the annotated node address 192.168.1.21", destIP)
+			if len(bindings) != 1 {
+				t.Fatalf("got %d bindings, want 1", len(bindings))
 			}
-			if got := destPorts.String(); got != tt.wantPorts {
+			if bindings[0].IP != "192.168.1.21" {
+				t.Errorf("destination IP = %q, want the annotated node address 192.168.1.21", bindings[0].IP)
+			}
+			if got := bindings[0].Ports.String(); got != tt.wantPorts {
 				t.Errorf("destination ports = %q, want %q", got, tt.wantPorts)
 			}
 		})
@@ -209,7 +215,7 @@ func TestGetServiceDestinationNodePortWithoutAllocatedNodePort(t *testing.T) {
 		},
 	}
 
-	if _, _, err := reconciler.getServiceDestination(
+	if _, err := reconciler.getServiceDestinations(
 		context.Background(), rule, ports.FromPort(8080)); err == nil {
 		t.Error("expected an error when the nodePort has not been allocated yet")
 	}
@@ -228,7 +234,7 @@ func TestGetServiceDestinationRejectsRangePastMaxPort(t *testing.T) {
 		},
 	}
 
-	if _, _, err := reconciler.getServiceDestination(
+	if _, err := reconciler.getServiceDestinations(
 		context.Background(), rule, ports.MustParse("8000-8009")); err == nil {
 		t.Error("expected an error when the derived internal range runs past the maximum port")
 	}
