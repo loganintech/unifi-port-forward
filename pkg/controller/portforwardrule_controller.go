@@ -127,32 +127,21 @@ func (r *PortForwardRuleReconciler) validateRule(ctx context.Context, rule *v1al
 	return nil
 }
 
+// ErrPortForwardOverlaps signals that UniFi rejected a rule because it overlaps
+// an existing one. Reconcile matches on the message and backs off rather than
+// retrying immediately.
+var ErrPortForwardOverlaps = fmt.Errorf("PortForwardOverlaps: requires backoff")
+
 // reconcilePortForwardRule creates/updates the port forwarding rule on the router
 func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context, rule *v1alpha1.PortForwardRule) error {
 	logger := ctrllog.FromContext(ctx)
-
-	// Create special error type for overlap scenario
-	ErrPortForwardOverlaps := fmt.Errorf("PortForwardOverlaps: requires backoff")
 
 	externalPorts, err := rule.Spec.ExternalPortSpec()
 	if err != nil {
 		return fmt.Errorf("invalid externalPort: %w", err)
 	}
 
-	var destIP string
-	var destPorts ports.Spec
-
-	if rule.Spec.ServiceRef != nil {
-		// The Service supplies both the destination IP and the internal port,
-		// so the rule never has to restate the port it already declares.
-		destIP, destPorts, err = r.getServiceDestination(ctx, rule, externalPorts)
-	} else if rule.Spec.DestinationIP != nil && rule.Spec.DestinationPort != nil {
-		destIP = *rule.Spec.DestinationIP
-		destPorts, err = rule.Spec.DestinationPortSpec()
-	} else {
-		return fmt.Errorf("invalid rule: neither serviceRef nor destinationIP specified")
-	}
-
+	bindings, err := r.destinationBindings(ctx, rule, externalPorts)
 	if err != nil {
 		return fmt.Errorf("failed to get destination: %w", err)
 	}
@@ -162,19 +151,77 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 		srcIP = *rule.Spec.SourceIPRestriction
 	}
 
-	routerRule := routers.PortConfig{
-		Name:      fmt.Sprintf("%s/%s:%s", rule.Namespace, rule.Name, externalPorts),
-		Enabled:   rule.Spec.Enabled,
-		Interface: rule.Spec.Interface,
-		DstPort:   externalPorts, // External port(s) (what users connect to)
-		FwdPort:   destPorts,     // Internal port(s) (what the service listens on)
-		SrcIP:     srcIP,
-		DstIP:     destIP,
-		Protocol:  rule.Spec.Protocol,
+	ruleIDs := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		// UniFi keys rules by name, so a rule that splits across protocols has to
+		// put the protocol in the name or its two halves would collide and each
+		// reconcile would rewrite the other.
+		name := fmt.Sprintf("%s/%s:%s", rule.Namespace, rule.Name, externalPorts)
+		if len(bindings) > 1 {
+			name = fmt.Sprintf("%s/%s", name, binding.Protocol)
+		}
+
+		routerRule := routers.PortConfig{
+			Name:      name,
+			Enabled:   rule.Spec.Enabled,
+			Interface: rule.Spec.Interface,
+			DstPort:   externalPorts, // External port(s) (what users connect to)
+			FwdPort:   binding.Ports, // Internal port(s) (what the service listens on)
+			SrcIP:     srcIP,
+			DstIP:     binding.IP,
+			Protocol:  binding.Protocol,
+		}
+
+		if err := r.applyRouterRule(ctx, rule, externalPorts, routerRule); err != nil {
+			return err
+		}
+		ruleIDs = append(ruleIDs, name)
 	}
 
+	now := metav1.Now()
+	rule.Status.RouterRuleID = strings.Join(ruleIDs, ",")
+	rule.Status.ExternalPorts = externalPorts.String()
+	rule.Status.LastAppliedTime = &now
+	rule.Status.ObservedGeneration = rule.Generation
+
+	if rule.Spec.ServiceRef != nil {
+		namespace := rule.Namespace
+		if rule.Spec.ServiceRef.Namespace != nil {
+			namespace = *rule.Spec.ServiceRef.Namespace
+		}
+
+		internal := make([]string, 0, len(bindings))
+		for _, binding := range bindings {
+			if len(bindings) > 1 {
+				internal = append(internal, fmt.Sprintf("%s/%s", binding.Ports, binding.Protocol))
+			} else {
+				internal = append(internal, binding.Ports.String())
+			}
+		}
+
+		rule.Status.ServiceStatus = &v1alpha1.ServiceStatus{
+			Name:           rule.Spec.ServiceRef.Name,
+			Namespace:      namespace,
+			LoadBalancerIP: bindings[0].IP,
+			ServicePort:    int32(bindings[0].Ports.Low()),
+			ServicePorts:   strings.Join(internal, ","),
+		}
+	}
+
+	r.Recorder.Event(rule, corev1.EventTypeNormal, "RuleApplied",
+		fmt.Sprintf("Port forwarding rule applied to router (ID: %s)", rule.Status.RouterRuleID))
+
+	logger.V(1).Info("Successfully applied port forwarding rule", "routerRuleID", rule.Status.RouterRuleID)
+	return nil
+}
+
+// applyRouterRule creates or takes ownership of the single router rule described
+// by routerRule.
+func (r *PortForwardRuleReconciler) applyRouterRule(ctx context.Context, rule *v1alpha1.PortForwardRule, externalPorts ports.Spec, routerRule routers.PortConfig) error {
+	logger := ctrllog.FromContext(ctx)
+
 	// Property-based discovery: find rule by port+protocol (annotation controller pattern)
-	existingRule, exists, err := r.Router.CheckPort(ctx, externalPorts, rule.Spec.Protocol)
+	existingRule, exists, err := r.Router.CheckPort(ctx, externalPorts, routerRule.Protocol)
 	if err != nil {
 		return fmt.Errorf("failed to check existing router rule: %w", err)
 	}
@@ -202,7 +249,7 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 		if needsOwnership {
 			logger.Info("Taking ownership of existing port forward rule",
 				"port", externalPorts,
-				"protocol", rule.Spec.Protocol,
+				"protocol", routerRule.Protocol,
 				"existing_rule_id", existingRule.ID,
 				"existing_rule_name", existingRule.Name,
 				"new_rule_name", routerRule.Name,
@@ -213,7 +260,7 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 				if strings.Contains(err.Error(), "PortForwardOverlaps") {
 					logger.Info("Port forward overlap detected during ownership takeover, applying exponential backoff",
 						"port", externalPorts,
-						"protocol", rule.Spec.Protocol,
+						"protocol", routerRule.Protocol,
 						"rule_name", routerRule.Name)
 					return ErrPortForwardOverlaps
 				}
@@ -221,12 +268,12 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 			}
 			logger.Info("Successfully took ownership of port forward rule",
 				"port", externalPorts,
-				"protocol", rule.Spec.Protocol,
+				"protocol", routerRule.Protocol,
 				"rule_id", existingRule.ID)
 		} else {
 			logger.V(1).Info("Port forward rule exists and matches desired configuration",
 				"port", externalPorts,
-				"protocol", rule.Spec.Protocol,
+				"protocol", routerRule.Protocol,
 				"rule_id", existingRule.ID)
 		}
 	} else {
@@ -235,7 +282,7 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 			if strings.Contains(err.Error(), "PortForwardOverlaps") {
 				logger.Info("Port forward overlap detected during creation, applying exponential backoff",
 					"port", externalPorts,
-					"protocol", rule.Spec.Protocol,
+					"protocol", routerRule.Protocol,
 					"rule_name", routerRule.Name)
 				return ErrPortForwardOverlaps
 			}
@@ -243,41 +290,54 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 		}
 		logger.Info("Successfully created new port forward rule",
 			"port", externalPorts,
-			"protocol", rule.Spec.Protocol,
+			"protocol", routerRule.Protocol,
 			"rule_name", routerRule.Name)
 	}
 
-	ruleID := fmt.Sprintf("%s/%s:%s", rule.Namespace, rule.Name, externalPorts)
-
-	now := metav1.Now()
-	rule.Status.RouterRuleID = ruleID
-	rule.Status.ExternalPorts = externalPorts.String()
-	rule.Status.LastAppliedTime = &now
-	rule.Status.ObservedGeneration = rule.Generation
-
-	if rule.Spec.ServiceRef != nil {
-		namespace := rule.Namespace
-		if rule.Spec.ServiceRef.Namespace != nil {
-			namespace = *rule.Spec.ServiceRef.Namespace
-		}
-
-		rule.Status.ServiceStatus = &v1alpha1.ServiceStatus{
-			Name:           rule.Spec.ServiceRef.Name,
-			Namespace:      namespace,
-			LoadBalancerIP: destIP,
-			ServicePort:    int32(destPorts.Low()),
-			ServicePorts:   destPorts.String(),
-		}
-	}
-
-	r.Recorder.Event(rule, corev1.EventTypeNormal, "RuleApplied",
-		fmt.Sprintf("Port forwarding rule applied to router (ID: %s)", ruleID))
-
-	logger.V(1).Info("Successfully applied port forwarding rule", "routerRuleID", ruleID)
 	return nil
 }
 
-// getServiceDestination gets the destination IP and port(s) from a service
+// Protocol values accepted by PortForwardRuleSpec.Protocol.
+const (
+	protocolTCP  = "tcp"
+	protocolUDP  = "udp"
+	protocolBoth = "both"
+)
+
+// destinationBinding is one router rule's worth of resolved destination: the
+// protocol it carries, and where that protocol's traffic is sent.
+type destinationBinding struct {
+	Protocol string
+	IP       string
+	Ports    ports.Spec
+}
+
+// destinationBindings resolves a rule into the router rules needed to serve it.
+//
+// Nearly every rule resolves to exactly one binding. The exception is a "both"
+// rule pointing at a NodePort Service: Kubernetes allocates the TCP and UDP
+// nodePorts of a port pair independently, so the two protocols land on different
+// internal ports and no single UniFi rule - which carries one fwd_port - can
+// express the pair. Those split into one binding per protocol.
+func (r *PortForwardRuleReconciler) destinationBindings(ctx context.Context, rule *v1alpha1.PortForwardRule, externalPorts ports.Spec) ([]destinationBinding, error) {
+	if rule.Spec.ServiceRef == nil {
+		if rule.Spec.DestinationIP == nil || rule.Spec.DestinationPort == nil {
+			return nil, fmt.Errorf("invalid rule: neither serviceRef nor destinationIP specified")
+		}
+		destPorts, err := rule.Spec.DestinationPortSpec()
+		if err != nil {
+			return nil, err
+		}
+		return []destinationBinding{{
+			Protocol: rule.Spec.Protocol,
+			IP:       *rule.Spec.DestinationIP,
+			Ports:    destPorts,
+		}}, nil
+	}
+	return r.getServiceDestinations(ctx, rule, externalPorts)
+}
+
+// getServiceDestinations gets the destination IP and port(s) from a service
 // reference. Both are derived from the Service, so a rule using serviceRef never
 // has to name a destination port itself.
 //
@@ -291,7 +351,7 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 //
 // The range offset is skipped for NodePort services, whose nodePorts are
 // allocated individually and are not contiguous.
-func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, rule *v1alpha1.PortForwardRule, externalPorts ports.Spec) (string, ports.Spec, error) {
+func (r *PortForwardRuleReconciler) getServiceDestinations(ctx context.Context, rule *v1alpha1.PortForwardRule, externalPorts ports.Spec) ([]destinationBinding, error) {
 	namespace := rule.Namespace
 	if rule.Spec.ServiceRef.Namespace != nil {
 		namespace = *rule.Spec.ServiceRef.Namespace
@@ -299,12 +359,12 @@ func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, r
 
 	var service corev1.Service
 	if err := r.Get(ctx, client.ObjectKey{Name: rule.Spec.ServiceRef.Name, Namespace: namespace}, &service); err != nil {
-		return "", ports.Spec{}, fmt.Errorf("failed to get service: %w", err)
+		return nil, fmt.Errorf("failed to get service: %w", err)
 	}
 
 	dest, err := resolveServiceDestination(ctx, r.Client, &service)
 	if err != nil {
-		return "", ports.Spec{}, err
+		return nil, err
 	}
 
 	// Find the referenced service port
@@ -317,14 +377,26 @@ func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, r
 	}
 
 	if servicePort == nil {
-		return "", ports.Spec{}, fmt.Errorf("port %s not found in service %s/%s", rule.Spec.ServiceRef.Port, namespace, rule.Spec.ServiceRef.Name)
+		return nil, fmt.Errorf("port %s not found in service %s/%s", rule.Spec.ServiceRef.Port, namespace, rule.Spec.ServiceRef.Name)
+	}
+
+	isNodePort := service.Spec.Type == corev1.ServiceTypeNodePort
+
+	if rule.Spec.Protocol == protocolBoth && isNodePort {
+		split, err := r.splitNodePortBindings(&service, servicePort, dest.IP, namespace, rule.Spec.ServiceRef.Name)
+		if err != nil {
+			return nil, err
+		}
+		if split != nil {
+			return split, nil
+		}
 	}
 
 	destPort := int(servicePort.Port)
 	offsetRanges := true
-	if service.Spec.Type == corev1.ServiceTypeNodePort {
+	if isNodePort {
 		if servicePort.NodePort == 0 {
-			return "", ports.Spec{}, fmt.Errorf("port %s of NodePort service %s/%s has no nodePort allocated yet",
+			return nil, fmt.Errorf("port %s of NodePort service %s/%s has no nodePort allocated yet",
 				rule.Spec.ServiceRef.Port, namespace, rule.Spec.ServiceRef.Name)
 		}
 		destPort = int(servicePort.NodePort)
@@ -332,15 +404,56 @@ func (r *PortForwardRuleReconciler) getServiceDestination(ctx context.Context, r
 	}
 
 	if externalPorts.IsSinglePort() || !externalPorts.IsContiguous() || !offsetRanges {
-		return dest.IP, ports.FromPort(destPort), nil
+		return []destinationBinding{{Protocol: rule.Spec.Protocol, IP: dest.IP, Ports: ports.FromPort(destPort)}}, nil
 	}
 
 	destPorts, err := ports.ContiguousFrom(destPort, externalPorts.Count())
 	if err != nil {
-		return "", ports.Spec{}, fmt.Errorf("cannot forward external ports %s to service %s/%s port %d: %w",
+		return nil, fmt.Errorf("cannot forward external ports %s to service %s/%s port %d: %w",
 			externalPorts, namespace, rule.Spec.ServiceRef.Name, destPort, err)
 	}
-	return dest.IP, destPorts, nil
+	return []destinationBinding{{Protocol: rule.Spec.Protocol, IP: dest.IP, Ports: destPorts}}, nil
+}
+
+// splitNodePortBindings returns one binding per protocol when a "both" rule
+// points at a NodePort Service whose TCP and UDP nodePorts differ.
+//
+// It returns nil - meaning "do not split, handle this as a single both rule" -
+// when the referenced port has no sibling of the other protocol, or when the two
+// were pinned to a shared nodePort, which Kubernetes permits only when set
+// explicitly. Both cases are what a single "both" rule already handles correctly.
+func (r *PortForwardRuleReconciler) splitNodePortBindings(service *corev1.Service, servicePort *corev1.ServicePort, destIP, namespace, serviceName string) ([]destinationBinding, error) {
+	// The sibling is the entry exposing the same service port over the other
+	// protocol, which is how a TCP+UDP service is spelled in a Service spec.
+	var sibling *corev1.ServicePort
+	for i := range service.Spec.Ports {
+		candidate := &service.Spec.Ports[i]
+		if candidate.Port == servicePort.Port && candidate.Protocol != servicePort.Protocol {
+			sibling = candidate
+			break
+		}
+	}
+
+	if sibling == nil || sibling.NodePort == servicePort.NodePort {
+		return nil, nil
+	}
+
+	tcp, udp := servicePort, sibling
+	if servicePort.Protocol == corev1.ProtocolUDP {
+		tcp, udp = sibling, servicePort
+	}
+
+	for _, p := range []*corev1.ServicePort{tcp, udp} {
+		if p.NodePort == 0 {
+			return nil, fmt.Errorf("port %s/%s of NodePort service %s/%s has no nodePort allocated yet",
+				p.Name, strings.ToLower(string(p.Protocol)), namespace, serviceName)
+		}
+	}
+
+	return []destinationBinding{
+		{Protocol: protocolTCP, IP: destIP, Ports: ports.FromPort(int(tcp.NodePort))},
+		{Protocol: protocolUDP, IP: destIP, Ports: ports.FromPort(int(udp.NodePort))},
+	}, nil
 }
 
 // updateRuleStatusWithRetry updates status of PortForwardRule with retry logic for conflicts
@@ -476,28 +589,58 @@ func (r *PortForwardRuleReconciler) deleteRouterRuleByID(ctx context.Context, ru
 		return fmt.Errorf("invalid externalPort: %w", err)
 	}
 
-	// Use CheckPort to find the actual UniFi router rule ID
-	pf, exists, err := r.Router.CheckPort(ctx, externalPorts, rule.Spec.Protocol)
-	if err != nil {
-		return fmt.Errorf("failed to find router rule for deletion: %w", err)
+	// A "both" rule may have been applied as a single both rule or split into a
+	// tcp and a udp rule, depending on the Service it resolved to at the time.
+	// Which one it was is not recorded anywhere durable, so deletion sweeps all
+	// three rather than trusting the spec to describe what is on the router.
+	protocols := []string{rule.Spec.Protocol}
+	if rule.Spec.Protocol == protocolBoth {
+		protocols = append(protocols, protocolTCP, protocolUDP)
 	}
 
-	if !exists {
-		// Rule doesn't exist on router - consider this success
+	// Rules this CR owns are named "{namespace}/{name}:...". Matching on that
+	// prefix keeps the sweep from deleting a different CR's rule that happens to
+	// share an external port and protocol.
+	owned := fmt.Sprintf("%s/%s:", rule.Namespace, rule.Name)
+
+	var deleted int
+	for _, protocol := range protocols {
+		pf, exists, err := r.Router.CheckPort(ctx, externalPorts, protocol)
+		if err != nil {
+			return fmt.Errorf("failed to find router rule for deletion: %w", err)
+		}
+
+		if !exists || pf == nil {
+			continue
+		}
+
+		if !strings.HasPrefix(pf.Name, owned) {
+			logger.V(1).Info("Skipping router rule not owned by this resource during deletion",
+				"port", externalPorts,
+				"protocol", protocol,
+				"existing_rule_name", pf.Name)
+			continue
+		}
+
+		logger.V(1).Info("Deleting router rule by ID",
+			"routerRuleID", pf.ID,
+			"port", externalPorts,
+			"protocol", protocol)
+
+		if err := r.Router.DeletePortForwardByID(ctx, pf.ID); err != nil {
+			return err
+		}
+		deleted++
+	}
+
+	if deleted == 0 {
 		logger.V(1).Info("Router rule not found during deletion, assuming already cleaned up",
 			"port", externalPorts,
 			"protocol", rule.Spec.Protocol,
 			"routerRuleID", rule.Status.RouterRuleID)
-		return nil
 	}
 
-	// Delete using the actual UniFi router rule ID
-	logger.V(1).Info("Deleting router rule by ID",
-		"routerRuleID", pf.ID,
-		"port", externalPorts,
-		"protocol", rule.Spec.Protocol)
-
-	return r.Router.DeletePortForwardByID(ctx, pf.ID)
+	return nil
 }
 
 // handleRuleDeletion handles the deletion of a PortForwardRule
