@@ -151,7 +151,7 @@ func TestReconcileSplitsBothIntoTwoRouterRules(t *testing.T) {
 	reconciler, mockRouter := newRuleReconciler(t, dualProtocolNodePortService(31000, 31001))
 	rule := bothRule("game-tcp")
 
-	if err := reconciler.reconcilePortForwardRule(context.Background(), rule); err != nil {
+	if err := reconciler.reconcilePortForwardRule(context.Background(), rule, false); err != nil {
 		t.Fatalf("reconcilePortForwardRule returned error: %v", err)
 	}
 
@@ -198,7 +198,7 @@ func TestDeleteRouterRuleRemovesBothHalvesOfSplitRule(t *testing.T) {
 	reconciler, mockRouter := newRuleReconciler(t, dualProtocolNodePortService(31000, 31001))
 	rule := bothRule("game-tcp")
 
-	if err := reconciler.reconcilePortForwardRule(context.Background(), rule); err != nil {
+	if err := reconciler.reconcilePortForwardRule(context.Background(), rule, false); err != nil {
 		t.Fatalf("reconcilePortForwardRule returned error: %v", err)
 	}
 	if got := len(mockRouter.GetPortForwardRules()); got != 2 {
@@ -219,7 +219,7 @@ func TestDeleteRouterRuleRemovesBothHalvesOfSplitRule(t *testing.T) {
 func TestDeleteRouterRuleLeavesRulesItDoesNotOwn(t *testing.T) {
 	reconciler, mockRouter := newRuleReconciler(t, dualProtocolNodePortService(31000, 31001))
 
-	if err := reconciler.reconcilePortForwardRule(context.Background(), bothRule("game-tcp")); err != nil {
+	if err := reconciler.reconcilePortForwardRule(context.Background(), bothRule("game-tcp"), false); err != nil {
 		t.Fatalf("reconcilePortForwardRule returned error: %v", err)
 	}
 

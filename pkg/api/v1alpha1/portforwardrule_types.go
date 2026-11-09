@@ -73,6 +73,14 @@ type PortForwardRuleSpec struct {
 	// LogEnabled enables logging for this rule
 	// +kubebuilder:default=false
 	LogEnabled bool `json:"logEnabled,omitempty"`
+
+	// SuspendWhenNoEndpoints disables the router rule while the referenced
+	// Service has no endpoints at all - ready, not-ready or terminating - for
+	// longer than the controller's suspend grace period, and re-enables it as
+	// soon as one appears. A workload scaled to zero therefore closes its port
+	// without anything editing this spec. Requires ServiceRef.
+	// +kubebuilder:default=false
+	SuspendWhenNoEndpoints bool `json:"suspendWhenNoEndpoints,omitempty"`
 }
 
 // ExternalPortSpec parses ExternalPort into a normalized port spec.
@@ -108,6 +116,9 @@ const (
 	PhaseActive  = "Active"
 	PhaseFailed  = "Failed"
 	PhaseUnknown = "Unknown"
+	// PhaseSuspended means the rule is applied but disabled on the router
+	// because SuspendWhenNoEndpoints is set and its Service has no endpoints.
+	PhaseSuspended = "Suspended"
 )
 
 // ServiceReference references a Kubernetes Service
@@ -127,8 +138,14 @@ type ServiceReference struct {
 // PortForwardRuleStatus defines the observed state of PortForwardRule
 type PortForwardRuleStatus struct {
 	// Phase is the current phase of the rule
-	// +kubebuilder:validation:Enum=Pending;Active;Failed;Unknown
+	// +kubebuilder:validation:Enum=Pending;Active;Failed;Unknown;Suspended
 	Phase string `json:"phase,omitempty"`
+
+	// NoEndpointsSince is when the controller first saw the referenced Service
+	// with no endpoints. It is cleared as soon as an endpoint appears, and only
+	// tracked when SuspendWhenNoEndpoints is set. Kept in status so the grace
+	// period survives a controller restart.
+	NoEndpointsSince *metav1.Time `json:"noEndpointsSince,omitempty"`
 
 	// ObservedGeneration is the generation observed by the controller
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

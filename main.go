@@ -25,6 +25,7 @@ import (
 	"unifi-port-forward/pkg/routers"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -153,6 +154,9 @@ func runController(cmd *cobra.Command, args []string) error {
 
 	if err := corev1.AddToScheme(mgr.GetScheme()); err != nil {
 		return fmt.Errorf("failed to add corev1 to scheme: %w", err)
+	}
+	if err := discoveryv1.AddToScheme(mgr.GetScheme()); err != nil {
+		return fmt.Errorf("failed to add discoveryv1 to scheme: %w", err)
 	}
 	if err := apiextensionsv1.AddToScheme(mgr.GetScheme()); err != nil {
 		return fmt.Errorf("failed to add apiextensionsv1 to scheme: %w", err)

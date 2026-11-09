@@ -26,6 +26,9 @@ const (
 // by hand in InitFromEnv. Defaults live in SetDefaults and nowhere else - an
 // earlier `default:` tag here claimed a different router IP than SetDefaults
 // actually applied, which was invisible because nothing ever parsed the tags.
+// DefaultSuspendGrace applies when SUSPEND_GRACE is unset.
+const DefaultSuspendGrace = 2 * time.Minute
+
 type Config struct {
 	// UniFi Connection Settings
 	RouterIP string `env:"UNIFI_ROUTER_IP" json:"routerIp"`
@@ -39,6 +42,11 @@ type Config struct {
 	// Application Settings
 	Debug        bool          `env:"DEBUG" json:"debug"`
 	SyncInterval time.Duration `env:"UNIFI_SYNC_INTERVAL" json:"syncInterval"`
+
+	// SuspendGrace is how long a Service must have no endpoints before rules
+	// with suspendWhenNoEndpoints are disabled. It rides out the gap between
+	// the old pod going away and the new one appearing in a Recreate rollout.
+	SuspendGrace time.Duration `env:"SUSPEND_GRACE" json:"suspendGrace"`
 
 	// Finalizer settings
 	FinalizerMaxRetries    int           `env:"FINALIZER_MAX_RETRIES" json:"finalizerMaxRetries"`
@@ -138,6 +146,13 @@ func InitFromEnv(cfg *Config) {
 		}
 		cfg.SyncInterval = syncInterval
 	}
+	if envSuspendGrace := os.Getenv("SUSPEND_GRACE"); envSuspendGrace != "" {
+		suspendGrace, err := time.ParseDuration(envSuspendGrace)
+		if err != nil {
+			log.Fatal(err)
+		}
+		cfg.SuspendGrace = suspendGrace
+	}
 	if envDebug := os.Getenv("DEBUG"); envDebug != "" {
 		// Parse the value rather than testing it for emptiness: the latter made
 		// DEBUG=False enable debug logging, which is exactly what the shipped
@@ -166,6 +181,9 @@ func (c *Config) SetDefaults() {
 	}
 	if c.SyncInterval == 0 {
 		c.SyncInterval = 15 * time.Minute
+	}
+	if c.SuspendGrace == 0 {
+		c.SuspendGrace = DefaultSuspendGrace
 	}
 }
 

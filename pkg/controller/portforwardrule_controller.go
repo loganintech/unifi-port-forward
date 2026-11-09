@@ -13,6 +13,7 @@ import (
 	"unifi-port-forward/pkg/routers"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -21,6 +22,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -77,7 +79,15 @@ func (r *PortForwardRuleReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reconcilePortForwardRule(ctx, rule); err != nil {
+	susp, err := r.evaluateSuspension(ctx, rule, time.Now())
+	if err != nil {
+		// Without endpoint state the safe default is the spec as written, so
+		// carry on rather than leaving the router rule untouched.
+		logger.Error(err, "Failed to evaluate endpoint suspension; applying rule as specified")
+		susp = suspension{}
+	}
+
+	if err := r.reconcilePortForwardRule(ctx, rule, susp.Suspended); err != nil {
 		// Check for special overlap error that needs backoff
 		if err.Error() == "PortForwardOverlaps: requires backoff" {
 			logger.Info("Port forward overlap detected, applying exponential backoff",
@@ -96,10 +106,26 @@ func (r *PortForwardRuleReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseActive, "")
+	requeue := time.Minute * 5
+	if susp.Suspended {
+		if rule.Status.Phase != v1alpha1.PhaseSuspended {
+			r.Recorder.Event(rule, corev1.EventTypeNormal, "RuleSuspended", susp.Message)
+		}
+		r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseSuspended, susp.Message)
+	} else {
+		if rule.Status.Phase == v1alpha1.PhaseSuspended {
+			r.Recorder.Event(rule, corev1.EventTypeNormal, "RuleResumed", "Service has endpoints again; rule re-enabled")
+		}
+		r.updateRuleStatusWithRetry(ctx, rule, v1alpha1.PhaseActive, "")
+		// A pending suspension must be rechecked when its grace runs out, not at
+		// the next routine requeue.
+		if susp.RecheckAfter > 0 && susp.RecheckAfter < requeue {
+			requeue = susp.RecheckAfter + time.Second
+		}
+	}
 
-	logger.V(1).Info("Successfully reconciled PortForwardRule")
-	return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
+	logger.V(1).Info("Successfully reconciled PortForwardRule", "suspended", susp.Suspended)
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 // validateRule validates the PortForwardRule
@@ -132,8 +158,10 @@ func (r *PortForwardRuleReconciler) validateRule(ctx context.Context, rule *v1al
 // retrying immediately.
 var ErrPortForwardOverlaps = fmt.Errorf("PortForwardOverlaps: requires backoff")
 
-// reconcilePortForwardRule creates/updates the port forwarding rule on the router
-func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context, rule *v1alpha1.PortForwardRule) error {
+// reconcilePortForwardRule creates/updates the port forwarding rule on the router.
+// A suspended rule is still written, but disabled, so resuming it is a single
+// update and the router entry keeps its name.
+func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context, rule *v1alpha1.PortForwardRule, suspended bool) error {
 	logger := ctrllog.FromContext(ctx)
 
 	externalPorts, err := rule.Spec.ExternalPortSpec()
@@ -163,7 +191,7 @@ func (r *PortForwardRuleReconciler) reconcilePortForwardRule(ctx context.Context
 
 		routerRule := routers.PortConfig{
 			Name:      name,
-			Enabled:   rule.Spec.Enabled,
+			Enabled:   rule.Spec.Enabled && !suspended,
 			Interface: rule.Spec.Interface,
 			DstPort:   externalPorts, // External port(s) (what users connect to)
 			FwdPort:   binding.Ports, // Internal port(s) (what the service listens on)
@@ -464,6 +492,10 @@ func (r *PortForwardRuleReconciler) updateRuleStatusWithRetry(ctx context.Contex
 	backoffDuration := 100 * time.Millisecond
 	maxAttempts := 3
 
+	// The retry path re-reads the rule, which would drop the timestamp this
+	// reconcile computed; keep it so the grace period is not restarted.
+	noEndpointsSince := rule.Status.NoEndpointsSince
+
 	for attempt := range maxAttempts {
 		if attempt > 0 {
 			logger.Info("Retrying status update attempt",
@@ -487,16 +519,20 @@ func (r *PortForwardRuleReconciler) updateRuleStatusWithRetry(ctx context.Contex
 
 		// Apply status updates (this will modify the rule in-place)
 		rule.Status.Phase = phase
+		rule.Status.NoEndpointsSince = noEndpointsSince
 
 		conditionType := "RuleReady"
 		status := metav1.ConditionFalse
 		reason := "Failed"
 		message := errorMsg
 
-		if phase == v1alpha1.PhaseActive {
+		switch phase {
+		case v1alpha1.PhaseActive:
 			status = metav1.ConditionTrue
 			reason = "RuleApplied"
 			message = "Port forwarding rule successfully applied"
+		case v1alpha1.PhaseSuspended:
+			reason = "Suspended"
 		}
 
 		// Update or add condition
@@ -683,8 +719,15 @@ func (r *PortForwardRuleReconciler) handleRuleDeletion(ctx context.Context, name
 
 // SetupWithManager sets up the controller with the Manager
 func (r *PortForwardRuleReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1alpha1.PortForwardRule{}, serviceRefIndex, indexServiceRef); err != nil {
+		return fmt.Errorf("indexing PortForwardRules by serviceRef: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.PortForwardRule{}).
 		Owns(&corev1.Service{}). // Watch services that are referenced by rules
+		// Endpoint changes drive suspendWhenNoEndpoints. Without this a scale to
+		// zero would only be noticed at the next five-minute requeue.
+		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.rulesForEndpointSlice)).
 		Complete(r)
 }
