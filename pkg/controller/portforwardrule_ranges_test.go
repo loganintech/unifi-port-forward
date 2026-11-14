@@ -255,7 +255,7 @@ func TestReconcilePortForwardRuleCreatesRangeRule(t *testing.T) {
 		},
 	}
 
-	if err := reconciler.reconcilePortForwardRule(context.Background(), rule); err != nil {
+	if err := reconciler.reconcilePortForwardRule(context.Background(), rule, false); err != nil {
 		t.Fatalf("reconcilePortForwardRule returned error: %v", err)
 	}
 

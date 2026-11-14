@@ -21,6 +21,16 @@ rules:
       - get
       - list
       - watch
+  # Drives suspendWhenNoEndpoints: a rule follows whether its Service has any
+  # endpoints at all.
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - ""
     resources:

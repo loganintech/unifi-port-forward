@@ -48,6 +48,16 @@ func (r *PortForwardRule) validateSpec() field.ErrorList {
 		))
 	}
 
+	// Suspension is driven by the Service's endpoints, so a rule that forwards
+	// to a bare IP has nothing to watch.
+	if r.Spec.SuspendWhenNoEndpoints && r.Spec.ServiceRef == nil {
+		allErrs = append(allErrs, field.Invalid(
+			specPath.Child("suspendWhenNoEndpoints"),
+			true,
+			"requires serviceRef",
+		))
+	}
+
 	// Validate protocol
 	validProtocols := []string{"tcp", "udp", "both"}
 	if !contains(validProtocols, r.Spec.Protocol) {

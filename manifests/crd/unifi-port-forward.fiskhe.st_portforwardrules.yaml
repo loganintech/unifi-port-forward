@@ -147,6 +147,15 @@ spec:
                   no restriction)
                 format: ipv4
                 type: string
+              suspendWhenNoEndpoints:
+                default: false
+                description: |-
+                  SuspendWhenNoEndpoints disables the router rule while the referenced
+                  Service has no endpoints at all - ready, not-ready or terminating - for
+                  longer than the controller's suspend grace period, and re-enables it as
+                  soon as one appears. A workload scaled to zero therefore closes its port
+                  without anything editing this spec. Requires ServiceRef.
+                type: boolean
             required:
             - externalPort
             type: object
@@ -274,6 +283,14 @@ spec:
                 description: LastAppliedTime is when the rule was last applied
                 format: date-time
                 type: string
+              noEndpointsSince:
+                description: |-
+                  NoEndpointsSince is when the controller first saw the referenced Service
+                  with no endpoints. It is cleared as soon as an endpoint appears, and only
+                  tracked when SuspendWhenNoEndpoints is set. Kept in status so the grace
+                  period survives a controller restart.
+                format: date-time
+                type: string
               observedGeneration:
                 description: ObservedGeneration is the generation observed by the
                   controller
@@ -286,6 +303,7 @@ spec:
                 - Active
                 - Failed
                 - Unknown
+                - Suspended
                 type: string
               routerRuleID:
                 description: RouterRuleID is the ID of the rule on the router

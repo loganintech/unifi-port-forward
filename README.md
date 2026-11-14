@@ -57,9 +57,27 @@ just test
 - `UNIFI_API_KEY` : API key instead of user/pass. Untested(!)
 - `UNIFI_SITE`: UniFi site name (default: default)
 - `UNIFI_SYNC_INTERVAL`: Periodic reconcile interval (default: 15m, minimum 5m)
+- `SUSPEND_GRACE`: How long a Service must have no endpoints before rules with `suspendWhenNoEndpoints` are disabled (default: 2m)
 - `DEBUG`: Enable debug logging (default: false)
 
 Every variable has a matching CLI flag (`--router-ip`, `--api-key`, …). Precedence is flag, then environment variable, then default.
+
+### Closing ports for stopped workloads
+
+A `PortForwardRule` with a `serviceRef` can set `suspendWhenNoEndpoints: true`.
+The controller then watches the Service's EndpointSlices and disables the
+router rule once the Service has had **no endpoints at all** for
+`SUSPEND_GRACE`. It re-enables the rule as soon as an endpoint appears.
+
+- Readiness is ignored. A pod that is starting, updating or crash-looping still
+  holds an endpoint and keeps its port open. Only a workload with no pods,
+  for example one scaled to zero, closes it.
+- The grace period covers the gap in a `Recreate` rollout, where the old pod is
+  gone before the new one exists.
+- The router rule is disabled, not deleted, and the rule's spec is never
+  modified. Tools that own the spec (GitOps, Pulumi) see no drift.
+- While disabled, the rule shows phase `Suspended`, and
+  `status.noEndpointsSince` records when the endpoints disappeared.
 
 ### Authentication
 
